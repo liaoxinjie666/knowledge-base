@@ -1,0 +1,47 @@
+# ============================================================
+# 个人知识库 — 依赖清单
+# ============================================================
+#
+# 安装说明：
+# 1. 先安装 PyTorch（根据你的硬件选择 CPU 或 GPU 版本）：
+#    CPU 版：pip install torch --index-url https://download.pytorch.org/whl/cpu
+#    GPU 版：pip install torch --index-url https://download.pytorch.org/whl/cu121
+#    GPU 版请访问 https://pytorch.org/get-started/locally/ 选择对应 CUDA 版本
+#
+# 2. 然后安装其他依赖：
+#    pip install -r requirements.txt
+#
+# 3. 如需 .env 支持（可选）：
+#    pip install python-dotenv
+#
+# ============================================================
+
+# ==================== 向量模型 ====================
+sentence-transformers>=2.2,<3.0
+
+# ==================== PyTorch（需单独安装，见上方说明）====================
+# CPU 版安装命令：pip install torch --index-url https://download.pytorch.org/whl/cpu
+# GPU 版安装命令：pip install torch --index-url https://download.pytorch.org/whl/cu121
+# 注意：请根据你的 CUDA 版本选择对应的 index-url
+
+# ==================== 向量数据库 ====================
+chromadb>=0.4,<1.0
+
+# ==================== 混合检索（BM25 + jieba 分词）====================
+rank-bm25>=0.2.2
+jieba>=0.42.1
+
+# ==================== 文档解析 ====================
+PyMuPDF>=1.23
+python-docx>=1.0
+openpyxl>=3.0
+pandas>=2.0
+
+# ==================== LLM ====================
+openai>=1.0
+
+# ==================== Web 界面 ====================
+streamlit>=1.28.0
+
+# ==================== 可选依赖 ====================
+# python-dotenv>=1.0  # 如需 .env 文件支持，请取消此行注释

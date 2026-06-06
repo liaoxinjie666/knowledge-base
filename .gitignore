@@ -1,0 +1,8 @@
+settings.json
+uploads/
+chroma_db/
+logs/
+models/
+__pycache__/
+*.pyc
+.env
