@@ -4,6 +4,7 @@
 """
 
 import gc
+import html
 import json
 import logging
 import os
@@ -731,11 +732,13 @@ def page_qa():
                     for i, r in enumerate(results, 1):
                         sc = r["score"] * 100
                         color = "#22c55e" if sc > 60 else "#eab308" if sc > 40 else "#ef4444"
+                        safe_source = html.escape(r['source'])
+                        safe_text = html.escape(r['text'][:200])
                         st.markdown(f"""
                         <div class="retrieval-card">
                             <span class="score" style="background:{color}22; color:{color};">#{i} · {sc:.0f}%</span>
-                            <div class="source">📄 {r['source']}</div>
-                            <div style="font-size:0.82rem; color:#aaa; margin-top:4px;">{r['text'][:200]}{'...' if len(r['text']) > 200 else ''}</div>
+                            <div class="source">📄 {safe_source}</div>
+                            <div style="font-size:0.82rem; color:#aaa; margin-top:4px;">{safe_text}{'...' if len(r['text']) > 200 else ''}</div>
                         </div>
                         """, unsafe_allow_html=True)
 
@@ -826,7 +829,8 @@ def _show_welcome():
         with col_b:
             if st.button("📚 一键导入示例知识", type="primary", use_container_width=True):
                 vs = load_vector_store()
-                text = open(example_path, "r", encoding="utf-8").read()
+                with open(example_path, "r", encoding="utf-8") as f:
+                    text = f.read()
                 chunks = chunk_text(text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
                 count = vs.add_documents(chunks, source="示例知识.txt")
                 if "stats" in st.session_state:

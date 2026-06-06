@@ -4,6 +4,7 @@
 """
 
 import json
+import logging
 import os
 import time
 import hashlib
@@ -17,6 +18,8 @@ from sentence_transformers import SentenceTransformer
 from sentence_transformers.cross_encoder import CrossEncoder
 
 import config
+
+logger = logging.getLogger("kb")
 
 
 class VectorStore:
@@ -80,8 +83,8 @@ class VectorStore:
             try:
                 with open(self._registry_path, "r", encoding="utf-8") as f:
                     return json.load(f)
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"加载文件注册表失败: {e}")
         return {}
 
     def _save_registry(self):
@@ -89,7 +92,8 @@ class VectorStore:
         try:
             with open(self._registry_path, "w", encoding="utf-8") as f:
                 json.dump(self._registry, f, ensure_ascii=False, indent=2)
-        except Exception:
+        except Exception as e:
+            logger.warning(f"保存文件注册表失败: {e}")
             pass
 
     def register_file(self, source: str, chunk_count: int, file_size: int = 0, category: str = "未分类"):
@@ -173,20 +177,28 @@ class VectorStore:
             self._save_registry()
 
     def _rebuild_bm25_index(self):
-        """从 ChromaDB 重建 BM25 索引（全文索引）"""
+        """从 ChromaDB 重建 BM25 索引（同时缓存 metadata，避免重复查询）"""
         total = self.collection.count()
         if total == 0:
             self._bm25 = None
             self._bm25_docs = []
             self._bm25_tokenized_docs = []
+            self._bm25_sources = []
             return
 
-        all_data = self.collection.get(include=["documents"])
+        all_data = self.collection.get(include=["documents", "metadatas"])
         self._bm25_docs = list(all_data["documents"])
-        # 对所有文档做 jieba 分词
+        self._bm25_sources = [m.get("source", "未知") for m in all_data["metadatas"]]
         self._bm25_tokenized_docs = [list(jieba.lcut(doc)) for doc in self._bm25_docs]
         self._bm25 = BM25Okapi(self._bm25_tokenized_docs)
-        self._progress(f"[向量库] BM25 索引重建完成，文档数: {total}")
+
+    def _append_bm25(self, chunks: List[str], source: str):
+        """增量追加 BM25 索引（不需要全量重建）"""
+        new_tokenized = [list(jieba.lcut(doc)) for doc in chunks]
+        self._bm25_docs.extend(chunks)
+        self._bm25_tokenized_docs.extend(new_tokenized)
+        self._bm25_sources.extend([source] * len(chunks))
+        self._bm25 = BM25Okapi(self._bm25_tokenized_docs)
 
     @classmethod
     def _get_model(cls):
@@ -379,8 +391,8 @@ class VectorStore:
             )
             total_added += len(batch_chunks)
 
-        # 同步更新 BM25 索引
-        self._rebuild_bm25_index()
+        # 增量更新 BM25 索引（不全量重建）
+        self._append_bm25(chunks, source)
 
         # 注册文件到管理表
         self.register_file(source, total_added, file_size, category)
@@ -512,14 +524,10 @@ class VectorStore:
         top_indices = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[:top_k]
 
         hits = []
-        # 获取对应的 source 信息
-        all_meta = self.collection.get(include=["metadatas"])
-        meta_map = {i: all_meta["metadatas"][i] for i in range(len(all_meta["metadatas"]))}
-
         for idx in top_indices:
             hits.append({
                 "text": self._bm25_docs[idx],
-                "source": meta_map.get(idx, {}).get("source", "未知"),
+                "source": self._bm25_sources[idx] if idx < len(self._bm25_sources) else "未知",
                 "bm25_score": round(scores[idx], 4),
             })
 

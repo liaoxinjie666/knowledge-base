@@ -10,24 +10,12 @@ from typing import List
 logger = logging.getLogger("kb")
 
 
-def _debug_log(msg: str):
-    """直接写调试日志到文件（绕过 logging 配置问题）"""
-    try:
-        log_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "logs", "debug.log")
-        os.makedirs(os.path.dirname(log_path), exist_ok=True)
-        with open(log_path, "a", encoding="utf-8") as f:
-            import datetime
-            f.write(f"[{datetime.datetime.now()}] {msg}\n")
-    except Exception:
-        pass
-
-
 def parse_file(file_path: str) -> str:
     """
     根据文件扩展名自动选择解析器，返回纯文本内容
     """
     ext = os.path.splitext(file_path)[1].lower()
-    _debug_log(f"parse_file: 文件={os.path.basename(file_path)}, 扩展名={ext}, 完整路径={file_path}")
+    logger.info(f"parse_file: {os.path.basename(file_path)} (ext={ext})")
 
     if ext in (".txt", ".md", ".markdown"):
         return _parse_text(file_path)
@@ -36,12 +24,11 @@ def parse_file(file_path: str) -> str:
     elif ext == ".docx":
         return _parse_docx(file_path)
     elif ext == ".doc":
-        _debug_log(f"进入 .doc 解析分支: {file_path}")
         return _parse_doc(file_path)
     elif ext in (".xlsx", ".xls"):
         return _parse_excel(file_path)
     else:
-        _debug_log(f"不支持的扩展名: '{ext}' (原始文件名: {os.path.basename(file_path)})")
+        logger.error(f"不支持的文件格式: {ext}")
         raise ValueError(f"不支持的文件格式: {ext}")
 
 
@@ -294,9 +281,10 @@ def _parse_doc(file_path: str) -> str:
             tmp_path = tmp.name
 
         doc = app.Documents.Open(abs_path)
-        doc.SaveAs2(os.path.abspath(tmp_path), FileFormat=16)  # 16 = docx
-        doc.Close(False)
-        app.Quit()
+        try:
+            doc.SaveAs2(os.path.abspath(tmp_path), FileFormat=16)  # 16 = docx
+        finally:
+            doc.Close(False)
 
         result = _parse_docx(tmp_path)
         return result
@@ -308,6 +296,11 @@ def _parse_doc(file_path: str) -> str:
             "请用 Word/WPS 另存为 .docx 格式后重新上传"
         )
     finally:
+        # 确保 Word/WPS 进程被关闭
+        try:
+            app.Quit()
+        except Exception:
+            pass
         # 清理临时文件
         if tmp_path and os.path.exists(tmp_path):
             try:
