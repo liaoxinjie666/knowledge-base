@@ -21,6 +21,16 @@ COLLECTION_NAME = "knowledge_base"
 CHUNK_SIZE = 500       # 每块最大字符数
 CHUNK_OVERLAP = 50     # 相邻块的重叠字符数（保证上下文连贯）
 
+# ==================== 层级分块参数 ====================
+PARENT_CHUNK_SIZE = 1500    # 父块最大字符数
+CHILD_CHUNK_SIZE = 400      # 子块最大字符数（用于精确检索）
+
+# ==================== RAG 检索增强参数 ====================
+ENABLE_HYDE = True          # 启用 HyDE（Hypothetical Document Embeddings）
+ENABLE_MULTI_QUERY = True   # 启用多查询扩展
+MULTI_QUERY_COUNT = 3       # 多查询扩展生成的查询数量
+ENABLE_SELF_RAG = True      # 启用 Self-RAG 自我检索增强生成
+
 # ==================== OpenAI / LLM ====================
 # 通过环境变量 OPENAI_API_KEY 设置
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")

@@ -96,7 +96,8 @@ class VectorStore:
             logger.warning(f"保存文件注册表失败: {e}")
             pass
 
-    def register_file(self, source: str, chunk_count: int, file_size: int = 0, category: str = "未分类"):
+    def register_file(self, source: str, chunk_count: int, file_size: int = 0, category: str = "未分类",
+                      parent_chunks: List[str] = None):
         """注册一个新文件到注册表"""
         self._registry[source] = {
             "category": category,
@@ -104,7 +105,17 @@ class VectorStore:
             "chunk_count": chunk_count,
             "file_size": file_size,
         }
+        if parent_chunks:
+            self._registry[source]["parent_chunks"] = parent_chunks
         self._save_registry()
+
+    def _get_parent_text(self, source: str, parent_index: int) -> str:
+        """从注册表延迟查找父块文本（不存 ChromaDB metadata）"""
+        entry = self._registry.get(source, {})
+        parents = entry.get("parent_chunks", [])
+        if parents and 0 <= parent_index < len(parents):
+            return parents[parent_index]
+        return ""
 
     def unregister_file(self, source: str):
         """从注册表中移除文件"""
@@ -142,10 +153,18 @@ class VectorStore:
             self._save_registry()
 
     def batch_delete(self, sources: List[str]) -> int:
-        """批量删除多个文件，返回删除的片段总数"""
+        """批量删除多个文件，返回删除的片段总数。只在最后重建一次 BM25。"""
         total_deleted = 0
         for source in sources:
-            total_deleted += self.delete_by_source(source)
+            results = self.collection.get(where={"source": source})
+            if results["ids"]:
+                self.collection.delete(ids=results["ids"])
+                self.unregister_file(source)
+                total_deleted += len(results["ids"])
+        # 所有文件删完后，统一重建一次 BM25 索引
+        if total_deleted > 0:
+            self._rebuild_bm25_index()
+            self._stats_cache["data"] = None
         return total_deleted
 
     def _migrate_existing_files(self):
@@ -345,9 +364,9 @@ class VectorStore:
         return all_embeddings
 
     @staticmethod
-    def _make_id(text: str, source: str) -> str:
+    def _make_id(text: str, source: str, extra: str = "") -> str:
         """根据文本内容和来源生成唯一 ID（用于去重）"""
-        raw = f"{source}::{text}"
+        raw = f"{source}::{extra}::{text}" if extra else f"{source}::{text}"
         return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
     def add_documents(self, chunks: List[str], source: str, batch_size: int = 256,
@@ -402,6 +421,207 @@ class VectorStore:
 
         return total_added
 
+    def add_documents_hierarchical(self, parent_chunks: List[str], child_docs: List[Dict],
+                                    source: str, batch_size: int = 256,
+                                    file_size: int = 0, category: str = "未分类") -> int:
+        """
+        层级分块入库：将子块入库，同时记录其所属父块文本。
+
+        Args:
+            parent_chunks: 父块文本列表
+            child_docs: 子块文档列表，每个元素为 dict，包含至少 "text" 和 "parent_index" 字段
+            source: 来源文件名
+            batch_size: 每批处理的片段数量，默认 256
+            file_size: 文件大小（字节）
+            category: 文件分类
+        Returns:
+            实际新增的子块数量
+        """
+        if not child_docs:
+            return 0
+
+        total_added = 0
+        total_batches = (len(child_docs) + batch_size - 1) // batch_size
+
+        for i in range(0, len(child_docs), batch_size):
+            batch = child_docs[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            self._progress(f"[向量库] 层级入库中... ({batch_num}/{total_batches})")
+
+            # 提取子块文本，生成向量
+            texts = [doc["text"] for doc in batch]
+            embeddings = self._get_embedding(texts, batch_size=batch_size)
+
+            # 生成 ID 和元数据（不存 parent_text，通过注册表延迟查找）
+            ids = []
+            metadatas = []
+            for j, doc in enumerate(batch):
+                parent_index = doc.get("parent_index", 0)
+                doc_id = self._make_id(doc["text"], source, extra=f"{parent_index}_{i+j}")
+                ids.append(doc_id)
+                metadatas.append({
+                    "source": source,
+                    "chunk_index": i + j,
+                    "parent_index": parent_index,
+                    "chunk_type": "child",
+                })
+
+            # 写入 ChromaDB
+            self.collection.upsert(
+                ids=ids,
+                embeddings=embeddings,
+                documents=texts,
+                metadatas=metadatas,
+            )
+            total_added += len(batch)
+
+        # 增量更新 BM25 索引
+        child_texts = [doc["text"] for doc in child_docs]
+        self._append_bm25(child_texts, source)
+
+        # 注册文件到管理表（父块存注册表，不存 ChromaDB）
+        self.register_file(source, total_added, file_size, category, parent_chunks=parent_chunks)
+
+        # 清除统计缓存
+        self._stats_cache["data"] = None
+
+        return total_added
+
+    def search_hyde(self, query: str, hypothetical_answer: str,
+                    top_k: Optional[int] = None) -> List[Dict]:
+        """
+        HyDE 检索：同时用原始查询和假设性答案进行向量检索，用 RRF 融合结果。
+
+        Args:
+            query: 用户查询
+            hypothetical_answer: LLM 生成的假设性答案
+            top_k: 返回结果数量
+        Returns:
+            [{"text": "...", "child_text": "...", "source": "...", "score": ...}, ...]
+        """
+        k = top_k or config.TOP_K
+        total_count = self.collection.count()
+        if total_count == 0:
+            return []
+
+        candidate_k = min(20, total_count)
+
+        # 分别为查询和假设性答案生成向量
+        query_embedding = self._get_embedding([query])
+        hyde_embedding = self._get_embedding([hypothetical_answer])
+
+        # 用查询向量检索
+        results_q = self.collection.query(
+            query_embeddings=query_embedding,
+            n_results=candidate_k,
+            include=["documents", "metadatas", "distances"],
+        )
+        # 用假设性答案向量检索
+        results_h = self.collection.query(
+            query_embeddings=hyde_embedding,
+            n_results=candidate_k,
+            include=["documents", "metadatas", "distances"],
+        )
+
+        # RRF 融合
+        RRF_K = 60
+        all_docs: Dict[str, Dict] = {}
+
+        for rank, idx in enumerate(range(len(results_q["ids"][0]))):
+            meta = results_q["metadatas"][0][idx]
+            source = meta.get("source", "未知")
+            parent_index = meta.get("parent_index")
+            parent_text = self._get_parent_text(source, parent_index) if parent_index is not None else ""
+            doc_text = results_q["documents"][0][idx]
+            display_text = parent_text if parent_text else doc_text
+            child_text = doc_text if parent_text else None
+            doc_key = display_text
+
+            if doc_key not in all_docs:
+                entry: Dict = {
+                    "text": display_text,
+                    "source": source,
+                    "rrf_score": 0.0,
+                }
+                if child_text is not None:
+                    entry["child_text"] = child_text
+                all_docs[doc_key] = entry
+            all_docs[doc_key]["rrf_score"] += 1.0 / (RRF_K + rank + 1)
+
+        for rank, idx in enumerate(range(len(results_h["ids"][0]))):
+            meta = results_h["metadatas"][0][idx]
+            source = meta.get("source", "未知")
+            parent_index = meta.get("parent_index")
+            parent_text = self._get_parent_text(source, parent_index) if parent_index is not None else ""
+            doc_text = results_h["documents"][0][idx]
+            display_text = parent_text if parent_text else doc_text
+            child_text = doc_text if parent_text else None
+            doc_key = display_text
+
+            if doc_key not in all_docs:
+                entry = {
+                    "text": display_text,
+                    "source": meta.get("source", "未知"),
+                    "rrf_score": 0.0,
+                }
+                if child_text is not None:
+                    entry["child_text"] = child_text
+                all_docs[doc_key] = entry
+            all_docs[doc_key]["rrf_score"] += 1.0 / (RRF_K + rank + 1)
+
+        # 按 RRF 分数排序，取 top candidate 数量
+        sorted_docs = sorted(all_docs.values(), key=lambda x: x["rrf_score"], reverse=True)
+
+        # Rerank 合并后的候选结果
+        reranked = self._rerank(query, sorted_docs, top_k=k)
+
+        # 构建最终结果
+        result = []
+        max_rrf = sorted_docs[0]["rrf_score"] if sorted_docs else 1.0
+        for doc in reranked:
+            normalized_score = doc["rrf_score"] / max_rrf if max_rrf > 0 else 0
+            entry = {
+                "text": doc["text"],
+                "child_text": doc.get("child_text"),
+                "source": doc["source"],
+                "score": round(normalized_score, 4),
+            }
+            result.append(entry)
+
+        return result
+
+    def generate_document_summary(self, text: str, source: str, llm_client=None) -> str:
+        """
+        生成文档摘要。
+
+        Args:
+            text: 文档全文或前几块拼接的文本
+            source: 文档来源名称
+            llm_client: 可选的 LLM 客户端（需有 chat.completions.create 方法）
+        Returns:
+            2-3 句话的文档摘要
+        """
+        if llm_client is not None:
+            try:
+                response = llm_client.chat.completions.create(
+                    model=config.OPENAI_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": "你是一个文档摘要助手。请用 2-3 句话概括以下文档的核心内容，语言简洁。",
+                        },
+                        {"role": "user", "content": f"文档来源: {source}\n\n{text[:3000]}"},
+                    ],
+                    temperature=0.3,
+                    max_tokens=200,
+                )
+                return response.choices[0].message.content.strip()
+            except Exception as e:
+                logger.warning(f"LLM 摘要生成失败，使用回退方案: {e}")
+
+        # 回退：取前 500 字符
+        return text[:500].strip()
+
     def search(self, query: str, top_k: Optional[int] = None, score_threshold: Optional[float] = None) -> List[Dict]:
         """
         语义检索：根据查询文本返回最相关的文档片段。
@@ -435,11 +655,23 @@ class VectorStore:
             # ChromaDB 返回的是 distance，cosine 距离越小越相似
             distance = results["distances"][0][i]
             score = 1 - distance  # 转换为相似度分数
-            hits.append({
-                "text": results["documents"][0][i],
-                "source": results["metadatas"][0][i].get("source", "未知"),
-                "score": round(score, 4),
-            })
+            meta = results["metadatas"][0][i]
+            source = meta.get("source", "未知")
+            parent_index = meta.get("parent_index")
+            parent_text = self._get_parent_text(source, parent_index) if parent_index is not None else ""
+            if parent_text:
+                hits.append({
+                    "text": parent_text,
+                    "child_text": results["documents"][0][i],
+                    "source": source,
+                    "score": round(score, 4),
+                })
+            else:
+                hits.append({
+                    "text": results["documents"][0][i],
+                    "source": source,
+                    "score": round(score, 4),
+                })
 
         # Reranker 重排序后过滤并返回最终结果
         reranked = self._rerank(query, hits, top_k=final_k)

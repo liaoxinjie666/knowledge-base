@@ -35,7 +35,7 @@ logger.addHandler(_sh)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import config
-from parsers import parse_file, chunk_text
+from parsers import parse_file, chunk_text, chunk_text_hierarchical
 from vector_store import VectorStore
 from qa_chain import QAChain
 
@@ -614,13 +614,20 @@ def page_upload():
                     skip_count += 1
                     continue
 
-                chunks = chunk_text(text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
-                count = vs.add_documents(chunks, source=file.name, file_size=file.size)
+                # 重新上传时先清除同名文件的旧数据，避免 ID 碰撞
+                vs.delete_by_source(file.name)
+
+                parent_chunks, child_docs = chunk_text_hierarchical(text, config.CHILD_CHUNK_SIZE, config.PARENT_CHUNK_SIZE, config.CHUNK_OVERLAP)
+                if child_docs:
+                    count = vs.add_documents_hierarchical(parent_chunks, child_docs, source=file.name, file_size=file.size)
+                else:
+                    chunks = chunk_text(text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
+                    count = vs.add_documents(chunks, source=file.name, file_size=file.size)
                 file_elapsed = time.time() - file_start
                 st.success(f"✅ {file.name} → {count} 个片段 ({file_elapsed:.1f}s)")
                 success_count += 1
 
-                del text, chunks
+                del text
                 gc.collect()
                 progress_bar.progress((i + 1) / total)
 
@@ -662,8 +669,13 @@ def page_upload():
             if st.button("📥 文本入库", type="primary", use_container_width=True):
                 vs = load_vector_store()
                 name = paste_name.strip() or "粘贴文本"
-                chunks = chunk_text(paste_text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
-                count = vs.add_documents(chunks, source=name)
+                vs.delete_by_source(name)
+                parent_chunks, child_docs = chunk_text_hierarchical(paste_text, config.CHILD_CHUNK_SIZE, config.PARENT_CHUNK_SIZE, config.CHUNK_OVERLAP)
+                if child_docs:
+                    count = vs.add_documents_hierarchical(parent_chunks, child_docs, source=name)
+                else:
+                    chunks = chunk_text(paste_text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
+                    count = vs.add_documents(chunks, source=name)
                 st.success(f"✅ 已入库 {count} 个知识片段（来源: {name}）")
                 if "stats" in st.session_state:
                     del st.session_state.stats
@@ -706,14 +718,54 @@ def page_qa():
                 logger.info(f"用户提问: {user_input}")
                 logger.info(f"知识库文档数: {vs.collection.count()}, BM25文档数: {len(vs._bm25_docs)}")
 
-                results = vs.search_hybrid(user_input, top_k=config.TOP_K)
-                logger.info(f"search_hybrid 返回 {len(results)} 条结果")
+                results = []
+
+                # Step 1: Multi-Query（包含原始查询 + 变体查询）
+                if getattr(config, "ENABLE_MULTI_QUERY", False):
+                    st.write("🔄 生成多视角查询...")
+                    query_variants = [user_input] + qa.generate_multi_queries(user_input)
+                    all_results = []
+                    for variant in query_variants:
+                        variant_results = vs.search_hybrid(variant, top_k=config.TOP_K)
+                        all_results.extend(variant_results)
+                    # Deduplicate by text and sort by score
+                    seen_texts = set()
+                    deduped = []
+                    for r in all_results:
+                        if r["text"] not in seen_texts:
+                            seen_texts.add(r["text"])
+                            deduped.append(r)
+                    deduped.sort(key=lambda x: x["score"], reverse=True)
+                    results = deduped[:config.TOP_K * 2]
+                    logger.info(f"Multi-Query 合并后 {len(results)} 条结果")
+                else:
+                    results = vs.search_hybrid(user_input, top_k=config.TOP_K)
+
+                # Step 2: HyDE (fallback if no results)
+                if getattr(config, "ENABLE_HYDE", False) and not results:
+                    st.write("💡 生成假设性答案进行检索...")
+                    hypothetical = qa.generate_hypothetical_answer(user_input)
+                    results = vs.search_hyde(user_input, hypothetical, top_k=config.TOP_K)
+                    logger.info(f"HyDE 检索返回 {len(results)} 条结果")
+
+                # Fallback if still no results
+                if not results:
+                    logger.warning("检索返回空! 尝试纯向量检索...")
+                    results = vs.search_hybrid(user_input, top_k=config.TOP_K)
+                    if not results:
+                        vec = vs.search(user_input, top_k=5, score_threshold=None)
+                        logger.info(f"纯向量检索返回 {len(vec)} 条")
+                        results = vec
+
+                # Step 3: Self-RAG relevance verification
+                if getattr(config, "ENABLE_SELF_RAG", False) and results:
+                    st.write("🔎 验证检索结果相关性...")
+                    results = qa.assess_relevance(user_input, results)
+                    logger.info(f"Self-RAG 验证后 {len(results)} 条结果")
+
+                logger.info(f"最终检索返回 {len(results)} 条结果")
                 if results:
                     logger.info(f"最高分: {results[0]['score']:.4f}, 最低分: {results[-1]['score']:.4f}")
-                else:
-                    logger.warning("search_hybrid 返回空! 尝试纯向量检索...")
-                    vec = vs.search(user_input, top_k=5, score_threshold=None)
-                    logger.info(f"纯向量检索返回 {len(vec)} 条")
 
             threshold = st.session_state.get("score_threshold", getattr(config, "SCORE_THRESHOLD", 0.3))
             if results:
@@ -831,8 +883,13 @@ def _show_welcome():
                 vs = load_vector_store()
                 with open(example_path, "r", encoding="utf-8") as f:
                     text = f.read()
-                chunks = chunk_text(text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
-                count = vs.add_documents(chunks, source="示例知识.txt")
+                vs.delete_by_source("示例知识.txt")
+                parent_chunks, child_docs = chunk_text_hierarchical(text, config.CHILD_CHUNK_SIZE, config.PARENT_CHUNK_SIZE, config.CHUNK_OVERLAP)
+                if child_docs:
+                    count = vs.add_documents_hierarchical(parent_chunks, child_docs, source="示例知识.txt")
+                else:
+                    chunks = chunk_text(text, config.CHUNK_SIZE, config.CHUNK_OVERLAP)
+                    count = vs.add_documents(chunks, source="示例知识.txt")
                 if "stats" in st.session_state:
                     del st.session_state.stats
                 st.success(f"✅ 已导入 {count} 个知识片段！")
@@ -893,12 +950,14 @@ def page_manage():
         select_all = st.checkbox("全选", key="select_all", on_change=_toggle_select_all)
     with col_b:
         if st.button("🗑️ 删除选中", type="secondary"):
-            selected = st.session_state.get("selected_files", [])
+            # 从当前 checkbox 状态实时收集选中文件（不依赖上一轮的 session_state）
+            selected = [f["source"] for f in files if st.session_state.get(f"chk_{f['source']}", False)]
             if selected:
-                deleted = vs.batch_delete(selected)
-                st.success(f"已删除 {len(selected)} 个文件（{deleted} 个片段）")
+                with st.spinner(f"正在删除 {len(selected)} 个文件..."):
+                    deleted = vs.batch_delete(selected)
                 if "stats" in st.session_state:
                     del st.session_state.stats
+                st.success(f"已删除 {len(selected)} 个文件（{deleted} 个片段）")
                 st.rerun()
             else:
                 st.warning("请先勾选要删除的文件")

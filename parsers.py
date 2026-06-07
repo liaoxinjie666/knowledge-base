@@ -165,6 +165,69 @@ def _extract_tail_overlap(text: str, target_len: int) -> str:
     return tail
 
 
+def chunk_text_hierarchical(
+    text: str,
+    child_size: int = None,
+    parent_size: int = None,
+    chunk_overlap: int = None,
+) -> tuple:
+    """
+    层级分块：先按 parent_size 切分为父块，再将每个父块按 child_size 切分为子块。
+    返回 (parent_chunks, child_docs)：
+      - parent_chunks: List[str]  父块文本列表
+      - child_docs: List[Dict]    子块字典列表，每个 dict 含 "text" 和 "parent_index"
+    """
+    import config as _cfg
+
+    if parent_size is None:
+        parent_size = getattr(_cfg, "PARENT_CHUNK_SIZE", 1500)
+    if child_size is None:
+        child_size = getattr(_cfg, "CHILD_CHUNK_SIZE", 400)
+    if chunk_overlap is None:
+        chunk_overlap = getattr(_cfg, "CHUNK_OVERLAP", 50)
+
+    # 第一步：用现有 chunk_text 以 parent_size 切分得到父块
+    parent_chunks = chunk_text(text, chunk_size=parent_size, chunk_overlap=chunk_overlap)
+
+    # 第二步：对每个父块再按 child_size 切分，记录所属父块索引
+    child_docs = []
+    for idx, parent in enumerate(parent_chunks):
+        children = chunk_text(parent, chunk_size=child_size, chunk_overlap=chunk_overlap)
+        for child_text in children:
+            child_docs.append({"text": child_text, "parent_index": idx})
+
+    return parent_chunks, child_docs
+
+
+def table_to_markdown(df) -> str:
+    """
+    将 pandas DataFrame 转换为 Markdown 表格字符串
+    包含表头、分隔行和数据行，NaN 转为空字符串，管道字符转义
+    """
+    import pandas as pd
+
+    if df is None or df.empty:
+        return ""
+
+    # 构建表头
+    headers = [str(h).replace("|", "\\|") for h in df.columns]
+    header_line = "| " + " | ".join(headers) + " |"
+    separator = "| " + " | ".join(["---"] * len(headers)) + " |"
+
+    # 构建数据行
+    rows = []
+    for _, row in df.iterrows():
+        cells = []
+        for val in row:
+            if pd.isna(val):
+                cells.append("")
+            else:
+                cells.append(str(val).replace("|", "\\|"))
+        rows.append("| " + " | ".join(cells) + " |")
+
+    return "\n".join([header_line, separator] + rows)
+
+
 # ==================== 以下为各格式的具体解析实现 ====================
 
 
@@ -237,12 +300,32 @@ def _parse_docx(file_path: str) -> str:
         if text:
             paragraphs.append(text)
 
-    # 也提取表格内容
+    # 也提取表格内容，转为 Markdown 表格
+    import pandas as pd
     for table in doc.tables:
+        row_data = []
         for row in table.rows:
-            row_text = " | ".join(cell.text.strip() for cell in row.cells if cell.text.strip())
-            if row_text:
-                paragraphs.append(row_text)
+            row_data.append([cell.text.strip() for cell in row.cells])
+        if not row_data:
+            continue
+        try:
+            # 第一行作为表头，其余作为数据
+            # 统一列数：以最长行为准，短行补空字符串（处理合并单元格）
+            max_cols = max(len(r) for r in row_data)
+            normalized = [r + [""] * (max_cols - len(r)) for r in row_data]
+            header = normalized[0]
+            data_rows = normalized[1:]
+            df = pd.DataFrame(data_rows, columns=header)
+            md = table_to_markdown(df)
+            if md:
+                paragraphs.append(md)
+        except Exception as e:
+            # 合并单元格等复杂表格降级为纯文本
+            logger.warning(f"Word 表格转 Markdown 失败，降级为纯文本: {e}")
+            for row in row_data:
+                line = " | ".join(cell for cell in row if cell)
+                if line:
+                    paragraphs.append(line)
 
     return "\n".join(paragraphs)
 
@@ -314,7 +397,7 @@ def _parse_doc(file_path: str) -> str:
 
 
 def _parse_excel(file_path: str) -> str:
-    """解析 Excel 文件（逐行转成文本）"""
+    """解析 Excel 文件（使用 table_to_markdown 转成 Markdown 表格）"""
     import pandas as pd
 
     MAX_ROWS = 100000  # 限制最大行数，防止内存溢出
@@ -323,7 +406,7 @@ def _parse_excel(file_path: str) -> str:
         # 先获取所有 sheet 名称
         xl = pd.ExcelFile(file_path)
         sheet_names = xl.sheet_names
-        all_rows = []
+        sheet_tables = []
 
         for sheet in sheet_names:
             try:
@@ -335,31 +418,23 @@ def _parse_excel(file_path: str) -> str:
             if df.empty:
                 continue
 
-            # 逐行处理，防止 iterrows 效率问题，同时消毒公式注入
-            for _, row in df.iterrows():
-                parts = []
-                for col in df.columns:
-                    val = row[col]
-                    if pd.isna(val):
-                        continue
-                    val_str = str(val).strip()
-                    if not val_str:
-                        continue
-                    # 消毒：移除以 =、+、-、@ 开头的危险公式注入字符
-                    if val_str.startswith(("=", "+", "-", "@")):
-                        val_str = "'" + val_str  # 加前缀防止公式执行
-                    parts.append(f"{col}: {val_str}")
-                if parts:
-                    all_rows.append("；".join(parts))
+            # 消毒：移除以 =、+、-、@ 开头的危险公式注入字符
+            for col in df.columns:
+                df[col] = df[col].apply(
+                    lambda x: "'" + str(x) if isinstance(x, str) and x.startswith(("=", "+", "-", "@")) else x
+                )
 
-        if not all_rows:
+            md = table_to_markdown(df)
+            if md:
+                if len(sheet_names) > 1:
+                    sheet_tables.append(f"## Sheet: {sheet}\n{md}")
+                else:
+                    sheet_tables.append(md)
+
+        if not sheet_tables:
             return ""
 
-        # 如果有多个 sheet，拼接时标注来源
-        if len(sheet_names) > 1:
-            return "\n".join(all_rows) + f"\n（共读取 {len(sheet_names)} 个 Sheet）"
-        else:
-            return "\n".join(all_rows)
+        return "\n\n".join(sheet_tables)
 
     except FileNotFoundError:
         raise ValueError(f"Excel 文件不存在: {file_path}")
